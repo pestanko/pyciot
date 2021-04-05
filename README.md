@@ -37,14 +37,24 @@ the [JUNIT CML Report](https://docs.gitlab.com/ee/ci/unit_test_reports.html)
 pip install --user junitparser
 pip install --user PyYAML
 
-wget https://github.com/pestanko/pyminihw/blob/master/ciot.py
+wget https://github.com/pestanko/pyciot/blob/master/ciot.py
 ```
 
 Or clone the repository:
 
 ```shell
-git clone https://github.com/pestanko/pyminihw.git
+git clone https://github.com/pestanko/pyciot.git
 ```
+
+For development purposes this repository is unsing the [`Poetry`](https://python-poetry.org/) to manage Virtual Envs.
+Since this package has only 2 dependencies, it is not required to use it.
+
+```shell
+cd pyciot
+poetry install --no-root 
+poetry shell
+```
+
 
 ### Example Usage:
 
