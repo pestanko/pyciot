@@ -1,0 +1,32 @@
+unit:
+  name: "Echo"
+  desc: "Echo tests"
+
+tests:
+  - name: echo-1
+    desc: "Test echo single argument"
+    args: [ "hello" ]
+    out: echo-hello.out
+    exit: 0
+
+  - name: echo-2
+    desc: "Test echo multiple arguments"
+    args: [ "hello", "world" ]
+    out: echo-hello-world.out
+
+  - name: echo-templ
+    desc: "Test with template"
+
+    template:
+      args: [ "hello", "${WORD}" ]
+      out: "echo-hello-${WORD}.out"
+
+    cases:
+      - name: "world"
+        desc: "will heave word \"world\" in it"
+        var: { WORD: "world" }
+
+      - name: "svet"
+        desc: "will heave word \"svet\" in it"
+        var: { WORD: "svet" }
+
