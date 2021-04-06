@@ -92,11 +92,12 @@ class TestDef(GeneralDef):
     AD_EXCLUDE = ('units', 'suites', 'unit')
 
     def __init__(self, metadata: Dict['str', Any],
-                 stdin: Path = None, exit_code: Optional[int] = None, args: List[str] = None,
+                 stdin: Union[str, Dict] = None,
+                 exit_code: Optional[int] = None, args: List[str] = None,
                  env: Dict[str, Any] = None,
                  checks: List['CheckDef'] = None, unit: 'UnitDef' = None):
         super().__init__(metadata)
-        self.stdin: Optional[Path] = stdin
+        self.stdin: Union[str, Dict] = stdin
         self.args: List[str] = args
         self.exit_code: Optional[int] = exit_code
         self.checks: Optional[List['CheckDef']] = checks or []
@@ -123,6 +124,16 @@ class Assertion(AsDict):
 ##
 # Parse
 ##
+
+
+def _resolve_file(value: Any, root: Path) -> Union[Path, Dict]:
+    if isinstance(value, Path) or isinstance(value, str):
+        value = Path(value)
+        return value if value.is_absolute() else (root / value).resolve()
+    if isinstance(value, dict):
+        # TODO: implement file content provider
+        return value
+    return value
 
 
 class DefinitionParser:
@@ -194,8 +205,6 @@ class DefinitionParser:
             return self.parse_test_template(unit_definition, df, name, desc)
 
         stdin = df.get('in', df.get('stdin'))
-        if stdin:
-            stdin = self._resolve_file(stdin)
         args = df.get('args', [])
         # Ability to explicitly set to None - null, if null, do not check
         exit_code = df['exit'] if 'exit' in df else 0
@@ -256,20 +265,11 @@ class DefinitionParser:
     def _file_assertion(self, selector: str, value, test_df: 'TestDef'):
         assertion = Assertion(
             FileAssertionRunner.NAME,
-            dict(selector=selector, expected=self._resolve_file(value))
+            dict(selector=selector, expected=value)
         )
         check = CheckDef("file_check", f"Check the file content [{selector}]",
                          assertion, test=test_df)
         return check
-
-    def _resolve_file(self, value: Any) -> Union[Path, Dict]:
-        if isinstance(value, Path) or isinstance(value, str):
-            value = Path(value)
-            return value if value.is_absolute() else (self.data_dir / value).resolve()
-        if isinstance(value, dict):
-            # TODO: implement file content provider
-            return value
-        return value
 
     def _find_units(self, suites: 'SuitesDef', name: str = '*') -> List['UnitDef']:
         units = []
@@ -438,19 +438,21 @@ class DefinitionRunner:
         test_result = TestRunResult(test_df)
         cmd, args = self._get_command(test_df, unit_ws, settings)
         timeout = settings.get('timeout', GLOBAL_TIMEOUT)
+        data_dir = Path(settings.get('data', self.paths.data_dir))
+        stdin = _resolve_file(test_df.stdin, root=data_dir)
         try:
             cmd_res = execute_cmd(cmd,
                                   args=args,
-                                  stdin=test_df.stdin,
+                                  stdin=stdin,
                                   nm=test_df.name,
                                   env=test_df.env,
                                   timeout=timeout,
                                   ws=unit_ws)
             test_result.cmd_result = cmd_res
-            ctx = TestCtx(self.paths, test_df, cmd_res)
-            if settings.get('valgrind', False):
-                test_df.checks.append(CheckDef("valgrind", "Check the execution using valgrind",
-                                               Assertion("")))
+            ctx = TestCtx(self.paths, test_df, cmd_res, settings)
+            # if settings.get('valgrind', False):
+            #     test_df.checks.append(CheckDef("valgrind", "Check the execution using valgrind",
+            #                                    Assertion("")))
             for check_df in test_df.checks:
                 check_result = self.run_check(ctx, check_df)
                 LOG.debug(f"[RUN] Check {check_df.name} for"
@@ -460,7 +462,7 @@ class DefinitionRunner:
         except Exception as e:
             LOG.error("Execution failed: ", e)
             test_result.kind = ResultKind.FAIL
-            test_result.message = "Execution failed"
+            test_result.message = f"Execution failed: {e}"
             return test_result
 
     def _get_command(self, test_df: 'TestDef', unit_ws: Path, settings):
@@ -490,14 +492,20 @@ class DefinitionRunner:
 
 
 class TestCtx:
-    def __init__(self, paths: 'AppConfig', test_df: 'TestDef', cmd_res: 'CommandResult'):
+    def __init__(self, paths: 'AppConfig', test_df: 'TestDef',
+                 cmd_res: 'CommandResult', settings: Dict[str, Any]):
         self.paths = paths
         self.test_df = test_df
         self.cmd_res = cmd_res
+        self.settings = settings
 
     @property
     def ws(self) -> Path:
         return self.paths.unit_workspace(self.test_df.unit.name)
+
+    @property
+    def data_dir(self) -> Path:
+        return Path(self.settings.get('data', self.paths.data_dir))
 
 
 class AssertionRunner:
@@ -523,7 +531,7 @@ class FileAssertionRunner(AssertionRunner):
     NAME = "file_cmp"
 
     def evaluate(self) -> 'CheckResult':
-        expected = self.params['expected']
+        expected = _resolve_file(self.params['expected'], self.ctx.data_dir)
         selector = self.params['selector']
         provided = self._get_provided(selector)
         if not provided.exists():
