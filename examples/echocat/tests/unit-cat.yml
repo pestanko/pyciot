@@ -1,25 +1,25 @@
 unit:
-  name: "unit-echo-wrong"
-  desc: "Echo tests - wrong tests definition"
+  name: "unit-cat"
+  desc: "Cat tests"
 
 tests:
-  - name: echo-1
-    desc: "Test echo single argument"
-    args: [ "hello" ]
+  - name: cat-1
+    desc: "Test cat stdin"
+    in: echo-hello.out
     out: echo-hello.out
-    exit: 1
+    exit: 0
 
-  - name: echo-2
-    desc: "Test echo multiple arguments"
-    args: [ "hello", "world" ]
-    out: echo-hello.out
+  - name: cat-2
+    desc: "Test cat hello world"
+    args: ['examples/echocat/tests/data/echo-hello-world.out']
+    out: echo-hello-world.out
 
   - name: echo-templ
     desc: "Test with template"
 
     template:
-      args: [ "hello", "${WORD}" ]
       out: "echo-hello-${WORD}.out"
+      in: "echo-hello-${WORD}.out"
 
     cases:
       - name: "world"

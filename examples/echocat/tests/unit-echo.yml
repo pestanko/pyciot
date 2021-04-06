@@ -1,5 +1,5 @@
 unit:
-  name: "Echo"
+  name: "unit-echo"
   desc: "Echo tests"
 
 tests:

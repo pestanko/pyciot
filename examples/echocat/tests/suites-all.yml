@@ -1,0 +1,19 @@
+master:
+  name: 'echo'
+  desc: 'execute echo master'
+
+units:
+  - 'unit-echo'
+  - 'unit-echo-wrong'
+  - 'unit-cat'
+
+
+overrides:
+  - unit: 'unit-echo'
+    command: '/usr/bin/echo'
+
+  - unit: 'unit-echo-wrong'
+    command: '/usr/bin/echo'
+
+  - unit: 'unit-cat'
+    command: '/usr/bin/cat'

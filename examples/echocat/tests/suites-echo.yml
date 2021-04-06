@@ -1,0 +1,7 @@
+master:
+  name: 'echo'
+  desc: 'execute echo master'
+
+units:
+  - 'unit-echo'
+  - 'unit-echo-wrong'
