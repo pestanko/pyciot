@@ -326,8 +326,15 @@ class GeneralResult(AsDict):
 
     def add_subresult(self, res: 'GeneralResultType'):
         self.sub_results.append(res)
-        if res.kind.is_fail():
+        if self.is_pass() and res.kind.is_fail():
+            self.message = "Some of the sub-results has failed"
             self.kind = res.kind
+
+    def is_pass(self) -> bool:
+        return self.kind.is_pass()
+
+    def is_fail(self) -> bool:
+        return self.kind.is_fail()
 
 
 class SuitesRunResult(GeneralResult):
@@ -386,6 +393,19 @@ class CheckResult(GeneralResult):
         return result
 
 
+def _merge_settings(unit_df: 'UnitDef') -> Dict[str, Any]:
+    suites = unit_df.suites
+    settings = {**suites.settings, **unit_df.settings}
+    if suites.overrides:
+        for uo in suites.overrides:
+            if uo['unit'] != unit_df.name:
+                continue
+            for k, v in uo.items():
+                if k != 'unit':
+                    settings[k] = v
+    return settings
+
+
 class DefinitionRunner:
     def __init__(self, paths: 'AppConfig'):
         self.paths = paths
@@ -403,7 +423,7 @@ class DefinitionRunner:
         LOG.info(f"[RUN] Running the unit: {unit_df.name}")
         unit_result = UnitRunResult(unit_df)
         unit_ws = self.paths.unit_workspace(unit_df.name)
-        settings = self._merge_settings(unit_df)
+        settings = _merge_settings(unit_df)
         LOG.debug(f"[RUN] Creating unit workspace: {unit_ws}")
         for test_df in unit_df.tests:
             test_result = self.run_test(test_df, unit_ws, settings=settings)
@@ -412,27 +432,15 @@ class DefinitionRunner:
         LOG.debug(f"[RUN] Unit result: {unit_result.kind} ")
         return unit_result
 
-    def _merge_settings(self, unit_df: 'UnitDef') -> Dict[str, Any]:
-        suites = unit_df.suites
-        settings = {**suites.settings, **unit_df.settings}
-        if suites.overrides:
-            for uo in suites.overrides:
-                if uo['unit'] != unit_df.name:
-                    continue
-                for k, v in uo.items():
-                    if k != 'unit':
-                        settings[k] = v
-        return settings
-
     def run_test(self, test_df: 'TestDef', unit_ws: Path,
                  settings: Dict[str, Any] = None) -> 'TestRunResult':
         LOG.info(f"[RUN] Running the test{test_df.name} from {test_df.unit.name}")
         test_result = TestRunResult(test_df)
-        cmd = settings.get('command', self.paths.command)
+        cmd, args = self._get_command(test_df, unit_ws, settings)
         timeout = settings.get('timeout', GLOBAL_TIMEOUT)
         try:
             cmd_res = execute_cmd(cmd,
-                                  args=test_df.args,
+                                  args=args,
                                   stdin=test_df.stdin,
                                   nm=test_df.name,
                                   env=test_df.env,
@@ -440,6 +448,9 @@ class DefinitionRunner:
                                   ws=unit_ws)
             test_result.cmd_result = cmd_res
             ctx = TestCtx(self.paths, test_df, cmd_res)
+            if settings.get('valgrind', False):
+                test_df.checks.append(CheckDef("valgrind", "Check the execution using valgrind",
+                                               Assertion("")))
             for check_df in test_df.checks:
                 check_result = self.run_check(ctx, check_df)
                 LOG.debug(f"[RUN] Check {check_df.name} for"
@@ -451,6 +462,21 @@ class DefinitionRunner:
             test_result.kind = ResultKind.FAIL
             test_result.message = "Execution failed"
             return test_result
+
+    def _get_command(self, test_df: 'TestDef', unit_ws: Path, settings):
+        cmd = settings.get('command', self.paths.command)
+        if not settings.get('valgrind', False):
+            return cmd, test_df.args
+        vg_cmd = 'valgrind'
+        va_log_file = unit_ws / f"{test_df.name}.val"
+        vg_args = [
+            "--leak-check=full",
+            "--track-fds=yes",
+            "--child-silent-after-fork=yes",
+            f'--log-file={va_log_file}'
+        ]
+        cmd_args = test_df.args
+        return vg_cmd, [*vg_args, '--', cmd, *cmd_args]
 
     def run_check(self, ctx: 'TestCtx', check_df: 'CheckDef'):
         LOG.info(f"[RUN] Running Check: {check_df.name} for {ctx.test_df.name}")
@@ -549,6 +575,31 @@ class ExitCodeAssertionRunner(AssertionRunner):
             expected=expected,
             diff="provided != expected"
         )
+
+
+class ValgrindAssertionRunner(AssertionRunner):
+    NAME = "valgrind"
+
+    def evaluate(self) -> 'CheckResult':
+        report = self.ctx.ws / f"{self.ctx.test_df.name}.val"
+        if not report.exists():
+            return CheckResult.mk_fail(self.check_df, "Valgrind report does not exists!")
+        number_of_errors = self._process_report(report)
+        return CheckResult(
+            self.check_df,
+            kind=ResultKind.check(number_of_errors == 0),
+            message="Valgrind validation failed",
+            provided=number_of_errors,
+            expected="0",
+            diff=f"{number_of_errors} != 0",
+            detail={
+                'report': report,
+            }
+        )
+
+    def _process_report(self, report: Path) -> int:
+        # TODO
+        return 0
 
 
 class AssertionRunners:
