@@ -69,7 +69,7 @@ class GeneralDef(AsDict):
         return self.metadata['pts']
 
 
-class SuitesDef(GeneralDef):
+class SuiteDef(GeneralDef):
     def __init__(self, metadata: Dict[str, Any], units: List['UnitDef'] = None):
         super().__init__(metadata)
         self.units = units or []
@@ -78,18 +78,18 @@ class SuitesDef(GeneralDef):
 
 
 class UnitDef(GeneralDef):
-    AD_EXCLUDE = ('units', 'suites')
+    AD_EXCLUDE = ('units', 'suite')
 
     def __init__(self, metadata: Dict[str, Any],
-                 tests: List['TestDef'] = None, suites: 'SuitesDef' = None):
+                 tests: List['TestDef'] = None, suite: 'SuiteDef' = None):
         super().__init__(metadata)
         self.tests = tests or []
-        self.suites = suites
+        self.suite = suite
         self.settings: Dict['str', Any] = {}
 
 
 class TestDef(GeneralDef):
-    AD_EXCLUDE = ('units', 'suites', 'unit')
+    AD_EXCLUDE = ('units', 'suite', 'unit')
 
     def __init__(self, metadata: Dict['str', Any],
                  stdin: Union[str, Dict] = None,
@@ -106,7 +106,7 @@ class TestDef(GeneralDef):
 
 
 class CheckDef(GeneralDef):
-    AD_EXCLUDE = ('units', 'suites', 'unit', 'test')
+    AD_EXCLUDE = ('units', 'suite', 'unit', 'test')
 
     def __init__(self, name: str, desc: str = None, assertion: 'Assertion' = None,
                  test: Optional['TestDef'] = None):
@@ -126,7 +126,7 @@ class Assertion(AsDict):
 ##
 
 
-def _resolve_file(value: Any, root: Path) -> Union[Path, Dict]:
+def _resolve_file(value: Any, root: Path) -> Union[Path, Dict, None]:
     if isinstance(value, Path) or isinstance(value, str):
         value = Path(value)
         return value if value.is_absolute() else (root / value).resolve()
@@ -141,47 +141,47 @@ class DefinitionParser:
         self.test_dir = test_dir
         self.data_dir = data_dir
 
-    def parse(self, unit: Path = None, suites: Path = None) -> 'SuitesDef':
+    def parse(self, unit: Path = None, suite: Path = None) -> 'SuiteDef':
         if unit is not None:
             udf = self.parse_unit(unit)
-            metadata = {'name': f"suites-{udf.name}", 'desc': udf.desc}
-            sdf = SuitesDef(metadata, units=[udf])
-            udf.suites = sdf
+            metadata = {'name': f"suite-{udf.name}", 'desc': udf.desc}
+            sdf = SuiteDef(metadata, units=[udf])
+            udf.suite = sdf
             return sdf
 
-        return self.suites_parser(suites)
+        return self.suite_parser(suite)
 
-    def suites_parser(self, suites_file: Optional[Path]) -> SuitesDef:
-        if suites_file:
-            return self._parse_suites_file(suites_file)
-        suites = SuitesDef(dict(name=self.test_dir.name))
-        suites.units = self._find_units(suites)
-        return suites
+    def suite_parser(self, suite_file: Optional[Path]) -> SuiteDef:
+        if suite_file:
+            return self._parse_suite_file(suite_file)
+        suite = SuiteDef(dict(name=self.test_dir.name))
+        suite.units = self._find_units(suite)
+        return suite
 
-    def parse_unit(self, unit_file: Path, suites: 'SuitesDef' = None) -> Optional[UnitDef]:
+    def parse_unit(self, unit_file: Path, suite: 'SuiteDef' = None) -> Optional[UnitDef]:
         unit_data = load_file(unit_file)
         if 'tests' not in unit_data and 'unit' not in unit_data:
             # It is not a valid unit file
             return None
         LOG.debug(f"Found unit: {unit_file}")
-        return self.parse_unit_definition(unit_data, unit_file.stem, suites=suites)
+        return self.parse_unit_definition(unit_data, unit_file.stem, suite=suite)
 
-    def parse_suites_definition(self, df: Dict[str, Any], master_name: str = None) -> 'SuitesDef':
+    def parse_suite_definition(self, df: Dict[str, Any], master_name: str = None) -> 'SuiteDef':
         metadata = self._parse_general_metadata(df, 'master', master_name)
-        suites_def = SuitesDef(metadata)
-        suites_def.settings = df.get('settings', {})
-        suites_def.overrides = df.get('overrides', [])
+        suite_def = SuiteDef(metadata)
+        suite_def.settings = df.get('settings', {})
+        suite_def.overrides = df.get('overrides', [])
 
         for unit_name in df['units']:
-            units = self._find_units(suites_def, name=unit_name)
-            suites_def.units.extend(units)
-        return suites_def
+            units = self._find_units(suite_def, name=unit_name)
+            suite_def.units.extend(units)
+        return suite_def
 
     def parse_unit_definition(self, df: Dict[str, Any], unit_name: str = None,
-                              suites: 'SuitesDef' = None) -> UnitDef:
+                              suite: 'SuiteDef' = None) -> UnitDef:
         metadata = self._parse_general_metadata(df, 'unit', unit_name)
         unit_definition = UnitDef(metadata)
-        unit_definition.suites = suites
+        unit_definition.suite = suite
         unit_definition.settings = df.get('settings', {})
 
         for test_df in df['tests']:
@@ -231,15 +231,15 @@ class DefinitionParser:
     def parse_checks(self, df: Dict[str, Any], test_df: 'TestDef') -> List['CheckDef']:
         checks = []
         stdout = df.get('out', df.get('stdout'))
-        if stdout is not None:
+        if not _should_ignore(stdout):
             checks.append(self._file_assertion("@stdout", stdout, test_df))
 
         stderr = df.get('err', df.get('stderr'))
-        if stderr is not None:
+        if not _should_ignore(stderr):
             checks.append(self._file_assertion("@stderr", stderr, test_df))
 
         exit_code = df.get('exit', df.get('exit_code', 0))
-        if exit_code is not None:
+        if not _should_ignore(exit_code):
             assertion = Assertion(ExitCodeAssertionRunner.NAME, dict(expected=exit_code))
             check = CheckDef("exit_check",
                              "Check the command exit code (main return value)",
@@ -271,22 +271,26 @@ class DefinitionParser:
                          assertion, test=test_df)
         return check
 
-    def _find_units(self, suites: 'SuitesDef', name: str = '*') -> List['UnitDef']:
+    def _find_units(self, suite: 'SuiteDef', name: str = '*') -> List['UnitDef']:
         units = []
-        for unit_path in self.test_dir.glob(f"{name}.*"):
+        for unit_path in self.test_dir.glob(f"*{name}.*"):
             if unit_path.suffix not in ['.json', '.yaml', '.yml']:
                 continue
-            unit = self.parse_unit(unit_file=unit_path, suites=suites)
+            unit = self.parse_unit(unit_file=unit_path, suite=suite)
             if unit:
                 units.append(unit)
         return units
 
-    def _parse_suites_file(self, suites_file: Path) -> Optional['SuitesDef']:
-        suites_data = load_file(suites_file)
-        if 'units' not in suites_data and 'master' not in suites_data:
+    def _parse_suite_file(self, suite_file: Path) -> Optional['SuiteDef']:
+        suite_data = load_file(suite_file)
+        if 'units' not in suite_data and 'master' not in suite_data:
             # It is not a valid unit file
             return None
-        return self.parse_suites_definition(suites_data, suites_file.stem)
+        return self.parse_suite_definition(suite_data, suite_file.stem)
+
+
+def _should_ignore(value) -> bool:
+    return value is None or value in ['ignore', 'any']
 
 
 ##
@@ -337,8 +341,8 @@ class GeneralResult(AsDict):
         return self.kind.is_fail()
 
 
-class SuitesRunResult(GeneralResult):
-    def __init__(self, df: 'SuitesDef'):
+class SuiteRunResult(GeneralResult):
+    def __init__(self, df: 'SuiteDef'):
         super().__init__(df)
 
     @property
@@ -394,10 +398,10 @@ class CheckResult(GeneralResult):
 
 
 def _merge_settings(unit_df: 'UnitDef') -> Dict[str, Any]:
-    suites = unit_df.suites
-    settings = {**suites.settings, **unit_df.settings}
-    if suites.overrides:
-        for uo in suites.overrides:
+    suite = unit_df.suite
+    settings = {**suite.settings, **unit_df.settings}
+    if suite.overrides:
+        for uo in suite.overrides:
             if uo['unit'] != unit_df.name:
                 continue
             for k, v in uo.items():
@@ -411,18 +415,18 @@ class DefinitionRunner:
         self.paths = paths
         self.assertion_runners = AssertionRunners.instance()
 
-    def run_suites(self, suites_df: 'SuitesDef') -> 'SuitesRunResult':
-        LOG.info(f"[RUN] Running the suites: {suites_df.name}")
-        suites_result = SuitesRunResult(suites_df)
-        for unit in suites_df.units:
+    def run_suite(self, suite_df: 'SuiteDef') -> 'SuiteRunResult':
+        LOG.info(f"[RUN] Running the suite: {suite_df.name}")
+        suite_result = SuiteRunResult(suite_df)
+        for unit in suite_df.units:
             unit_result = self.run_unit(unit)
-            suites_result.add_subresult(unit_result)
-        return suites_result
+            suite_result.add_subresult(unit_result)
+        return suite_result
 
     def run_unit(self, unit_df: UnitDef) -> 'UnitRunResult':
         LOG.info(f"[RUN] Running the unit: {unit_df.name}")
         unit_result = UnitRunResult(unit_df)
-        unit_ws = self.paths.unit_workspace(unit_df.name)
+        unit_ws = self.paths.unit_workspace(unit_df.suite.name, unit_df.name)
         settings = _merge_settings(unit_df)
         LOG.debug(f"[RUN] Creating unit workspace: {unit_ws}")
         for test_df in unit_df.tests:
@@ -501,7 +505,7 @@ class TestCtx:
 
     @property
     def ws(self) -> Path:
-        return self.paths.unit_workspace(self.test_df.unit.name)
+        return self.paths.unit_workspace(self.test_df.unit.suite.name, self.test_df.unit.name)
 
     @property
     def data_dir(self) -> Path:
@@ -657,11 +661,16 @@ def load_file(file: Path) -> Any:
     raise Exception(f"Unsupported format: {ext} for {file}")
 
 
+def _norm_template(template: str) -> str:
+    return template.replace("%<", "${").replace(">", "}")
+
+
 def deep_template_expand(template: Any, variables: Dict[str, Any]):
     if template is None:
         return None
     if isinstance(template, str):
-        return string.Template(template).safe_substitute(variables)
+        normalized = _norm_template(template)
+        return string.Template(normalized).safe_substitute(variables)
     if isinstance(template, list):
         return [deep_template_expand(i, variables) for i in template]
     if isinstance(template, dict):
@@ -809,9 +818,9 @@ class tcolors:
         return f"{color_prefix}{s}{self.ENDC}"
 
 
-def print_suites_df(sdf: 'SuitesDef', colors: bool = True):
+def print_suite_df(sdf: 'SuiteDef', colors: bool = True):
     tc = tcolors(colors)
-    print(f"SUITES: [{tc.wrap(tc.GREEN, sdf.name)}] :: {sdf.desc}")
+    print(f"SUITE: [{tc.wrap(tc.GREEN, sdf.name)}] :: {sdf.desc}")
     for df in sdf.units:
         print(f"\tUNIT: [{tc.wrap(tc.GREEN, df.name)}]", f":: {df.desc}")
         for test in df.tests:
@@ -825,8 +834,8 @@ def print_suites_df(sdf: 'SuitesDef', colors: bool = True):
         print()
 
 
-def print_suites_result(suites_res: 'SuitesRunResult', with_checks: bool = False,
-                        colors: bool = True):
+def print_suite_result(suite_res: 'SuiteRunResult', with_checks: bool = False,
+                       colors: bool = True):
     tc = tcolors(colors)
 
     def _prk(r: 'GeneralResultType'):
@@ -836,8 +845,8 @@ def print_suites_result(suites_res: 'SuitesRunResult', with_checks: bool = False
     def _p(r: 'GeneralResultType', t: str):
         return f"{_prk(r)} {t.capitalize()}: ({r.df.name}) :: {r.df.desc}"
 
-    print(_p(suites_res, 'Suite'))
-    for unit_res in suites_res.units:
+    print(_p(suite_res, 'Suite'))
+    for unit_res in suite_res.units:
         print(">>>", _p(unit_res, 'Unit'))
         for test_res in unit_res.tests:
             print(f"\t - {_p(test_res, 'Test')}")
@@ -856,10 +865,10 @@ def print_suites_result(suites_res: 'SuitesRunResult', with_checks: bool = False
                 print(ch_res.fail_msg("\t\t  [info] "))
         print()
 
-    print(f"\nOVERALL RESULT: {_prk(suites_res)}\n")
+    print(f"\nOVERALL RESULT: {_prk(suite_res)}\n")
 
 
-def dump_junit_report(suites_res: 'SuitesRunResult', artifacts: Path) -> Optional[Path]:
+def dump_junit_report(suite_res: 'SuiteRunResult', artifacts: Path) -> Optional[Path]:
     try:
         import junitparser
     except ImportError:
@@ -867,8 +876,8 @@ def dump_junit_report(suites_res: 'SuitesRunResult', artifacts: Path) -> Optiona
         return None
     report_path = artifacts / 'junit_report.xml'
     LOG.info(f"[REPORT] Generating JUNIT report: {report_path}")
-    suites = junitparser.JUnitXml(suites_res.df.name)
-    for unit_res in suites_res.units:
+    junit_suites = junitparser.JUnitXml(suite_res.df.name)
+    for unit_res in suite_res.units:
         unit_suite = junitparser.TestSuite(name=unit_res.df.name)
         for test_res in unit_res.tests:
             junit_case = junitparser.TestCase(
@@ -876,6 +885,7 @@ def dump_junit_report(suites_res: 'SuitesRunResult', artifacts: Path) -> Optiona
                 classname=test_res.df.unit.name + '/' + test_res.df.name,
                 time=test_res.cmd_result.elapsed / 1000000.0 if test_res.cmd_result else 0
             )
+            unit_suite.add_testcase(junit_case)
             if test_res.kind.is_pass():
                 continue
             fails = []
@@ -887,21 +897,28 @@ def dump_junit_report(suites_res: 'SuitesRunResult', artifacts: Path) -> Optiona
             if test_res.cmd_result:
                 junit_case.system_out = str(test_res.cmd_result.stdout)
                 junit_case.system_err = str(test_res.cmd_result.stderr)
-            unit_suite.add_testcase(junit_case)
-        suites.add_testsuite(unit_suite)
+        junit_suites.add_testsuite(unit_suite)
 
-    suites.write(str(report_path))
+    junit_suites.write(str(report_path))
     return report_path
 
 
-def _resolve_def_file(name: str, root: Path) -> Optional['Path']:
+def _resolve_def_file(name: str, root: Path, prefix=None) -> Optional['Path']:
+    LOG.debug(f">>> Resolving: {name} in {root}")
     if '.' in name:
         pth = Path(name)
         return pth if pth.exists() else root / pth
     for ext in ('json', 'yml', 'yaml'):
-        pth = root / f"{name}.{ext}"
+        fname = f"{name}.{ext}"
+        pth = root / fname
         if pth.exists():
             return pth
+        if prefix:
+            # Lets be compatible with kontr
+            pth = root / f"{prefix}-{fname}"
+            LOG.debug(f">>> Trying: {pth}")
+            if pth.exists():
+                return pth
     return None
 
 
@@ -916,11 +933,14 @@ class AppConfig(AsDict):
         self.data_dir: Path = Path(data_dir) if data_dir else _resolve_data_dir(tests_dir)
         self.artifacts: Path = Path(artifacts) if artifacts else _make_artifacts_dir()
 
-    def unit_workspace(self, name: str) -> Path:
-        ws = self.artifacts / name
+    def unit_workspace(self, suite: str, unit: str) -> Path:
+        ws = self.suite_workspace(suite) / unit
         if not ws.exists():
             ws.mkdir(parents=True)
         return ws
+
+    def suite_workspace(self, name: str) -> Path:
+        return self.artifacts / name
 
 
 def _resolve_data_dir(test_dir: Path) -> Path:
@@ -939,8 +959,8 @@ def make_cli_parser() -> argparse.ArgumentParser:
                          help="Location of the command/binary you would like to test")
         sub.add_argument('-U', '--unit', type=str,
                          help='Location or name of the unit/test definition file')
-        sub.add_argument('-S', '--suites', type=str,
-                         help='Location or name of the suites/master definition file')
+        sub.add_argument('-S', '--suite', type=str,
+                         help='Location or name of the suite/master definition file')
         sub.add_argument('-T', '--test-files', type=str, help='Location of the test files',
                          default='tests')
         sub.add_argument('-D', '--test-data-files', type=str,
@@ -970,27 +990,26 @@ def make_cli_parser() -> argparse.ArgumentParser:
 
 def _resolve_definition(cfg: AppConfig, args):
     if args.unit:
-        return {'unit': _resolve_def_file(args.unit, cfg.tests_dir)}
-    if args.suites:
-        return {'suites': _resolve_def_file(args.suites, cfg.tests_dir)}
+        return {'unit': _resolve_def_file(args.unit, cfg.tests_dir, prefix='unit')}
+    if args.suite:
+        return {'suite': _resolve_def_file(args.suite, cfg.tests_dir, 'master')}
     return {}
 
 
 def cli_parse(args):
     cfg = _app_get_cfg(args)
-    suites_df = _app_parse_suites(cfg, args)
+    suite_df = _app_parse_suite(cfg, args)
     if args.output in ['json', 'j']:
-        print(dump_json(suites_df))
+        print(dump_json(suite_df))
     else:
-        print_suites_df(suites_df)
+        print_suite_df(suite_df)
     return True
 
 
-def _app_parse_suites(cfg, args):
+def _app_parse_suite(cfg, args):
     defn = _resolve_definition(cfg, args)
     parser = DefinitionParser(cfg.tests_dir, data_dir=cfg.data_dir)
-    suites_df = parser.parse(**defn)
-    return suites_df
+    return parser.parse(**defn)
 
 
 def _app_get_cfg(args):
@@ -1012,12 +1031,12 @@ def _app_get_cfg(args):
 
 def cli_exec(args):
     cfg = _app_get_cfg(args)
-    suites_df = _app_parse_suites(cfg, args)
+    suite_df = _app_parse_suite(cfg, args)
     runner = DefinitionRunner(cfg)
-    result = runner.run_suites(suites_df)
-    print_suites_result(result)
-    ws = cfg.unit_workspace(suites_df.name)
-    print(f"UNIT WORKSPACE: {ws}")
+    result = runner.run_suite(suite_df)
+    print_suite_result(result)
+    ws = cfg.suite_workspace(suite_df.name)
+    print(f"SUITE WORKSPACE: {ws}")
     report = dump_junit_report(result, artifacts=ws)
     if report:
         print(f"JUNIT REPORT: {report}")
