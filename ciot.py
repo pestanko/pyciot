@@ -4,10 +4,13 @@ import copy
 import enum
 import json
 import logging
+import os
+import shutil
 import string
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Optional, Any, TypeVar, Type, Union
 
@@ -21,8 +24,10 @@ TBD
 """
 
 LOG = logging.getLogger(APP_NAME)
-GLOBAL_TIMEOUT = 10 * 60
+GLOBAL_TIMEOUT = 5
 FILE_EXTENSIONS = ('in', 'out', 'err', 'files', 'args')
+
+DParams = Dict[str, Any]
 
 
 ##
@@ -45,32 +50,42 @@ class AsDict:
 GeneralDefType = TypeVar('GeneralDefType', bound='GeneralDef')
 
 
+@dataclass(frozen=True)
+class DefinitionMetadata:
+    name: str
+    desc: str
+    pts: float = 0.0
+
+    @classmethod
+    def from_dict(cls, c: DParams) -> 'DefinitionMetadata':
+        return DefinitionMetadata(
+            name=c['name'],
+            desc=c.get('desc', c['name']),
+            pts=c.get('pts', 0.0)
+        )
+
+
 class GeneralDef(AsDict):
     """General definition - common base of all definitions"""
 
-    def __init__(self, metadata: Dict[str, Any]):
-        name = metadata['name']
-        self.metadata = {
-            'name': name,
-            'desc': metadata.get('desc', name),
-            'pts': metadata.get('pts', 0.0)
-        }
+    def __init__(self, metadata: DefinitionMetadata):
+        self.metadata: DefinitionMetadata = metadata
 
     @property
     def name(self) -> str:
-        return self.metadata['name']
+        return self.metadata.name
 
     @property
     def desc(self) -> str:
-        return self.metadata['desc']
+        return self.metadata.desc
 
     @property
     def pts(self) -> Optional[float]:
-        return self.metadata['pts']
+        return self.metadata.pts
 
 
 class SuiteDef(GeneralDef):
-    def __init__(self, metadata: Dict[str, Any], units: List['UnitDef'] = None):
+    def __init__(self, metadata: DefinitionMetadata, units: List['UnitDef'] = None):
         super().__init__(metadata)
         self.units = units or []
         self.settings: Dict['str', Any] = {}
@@ -80,10 +95,11 @@ class SuiteDef(GeneralDef):
 class UnitDef(GeneralDef):
     AD_EXCLUDE = ('units', 'suite')
 
-    def __init__(self, metadata: Dict[str, Any],
+    def __init__(self, metadata: DefinitionMetadata,
                  tests: List['TestDef'] = None, suite: 'SuiteDef' = None):
         super().__init__(metadata)
-        self.tests = tests or []
+        self.pre_tasks: List['TaskDef'] = []
+        self.tests: List['TestDef'] = tests or []
         self.suite = suite
         self.settings: Dict['str', Any] = {}
 
@@ -91,34 +107,30 @@ class UnitDef(GeneralDef):
 class TestDef(GeneralDef):
     AD_EXCLUDE = ('units', 'suite', 'unit')
 
-    def __init__(self, metadata: Dict['str', Any],
+    def __init__(self, metadata: DefinitionMetadata,
                  stdin: Union[str, Dict] = None,
                  exit_code: Optional[int] = None, args: List[str] = None,
                  env: Dict[str, Any] = None,
-                 checks: List['CheckDef'] = None, unit: 'UnitDef' = None):
+                 checks: List['TaskDef'] = None, unit: 'UnitDef' = None):
         super().__init__(metadata)
+        self.pre_tasks: List['TaskDef'] = []
         self.stdin: Union[str, Dict] = stdin
         self.args: List[str] = args
         self.exit_code: Optional[int] = exit_code
-        self.checks: Optional[List['CheckDef']] = checks or []
+        self.checks: Optional[List['TaskDef']] = checks or []
         self.env: Dict[str, Any] = env
         self.unit = unit
 
 
-class CheckDef(GeneralDef):
+class TaskDef(GeneralDef):
     AD_EXCLUDE = ('units', 'suite', 'unit', 'test')
 
-    def __init__(self, name: str, desc: str = None, assertion: 'Assertion' = None,
-                 test: Optional['TestDef'] = None):
-        super().__init__({'name': name, 'desc': desc})
-        self.assertion: 'Assertion' = assertion
+    def __init__(self, name: str, desc: str = None, kind: str = None,
+                 params: DParams = None, test: Optional['TestDef'] = None):
+        super().__init__(DefinitionMetadata(name, desc))
+        self.kind: str = kind or self.name
+        self.params: 'DParams' = params
         self.test: Optional['TestDef'] = test
-
-
-class Assertion(AsDict):
-    def __init__(self, kind: str, params: Dict[str, Any]):
-        self.kind: str = kind
-        self.params: Dict[str, Any] = params
 
 
 ##
@@ -144,7 +156,7 @@ class DefinitionParser:
     def parse(self, unit: Path = None, suite: Path = None) -> 'SuiteDef':
         if unit is not None:
             udf = self.parse_unit(unit)
-            metadata = {'name': f"suite-{udf.name}", 'desc': udf.desc}
+            metadata = DefinitionMetadata(f"suite-{udf.name}", udf.desc)
             sdf = SuiteDef(metadata, units=[udf])
             udf.suite = sdf
             return sdf
@@ -154,7 +166,8 @@ class DefinitionParser:
     def suite_parser(self, suite_file: Optional[Path]) -> SuiteDef:
         if suite_file:
             return self._parse_suite_file(suite_file)
-        suite = SuiteDef(dict(name=self.test_dir.name))
+        metadata = DefinitionMetadata.from_dict({'name': self.test_dir.name})
+        suite = SuiteDef(metadata)
         suite.units = self._find_units(suite)
         return suite
 
@@ -163,11 +176,14 @@ class DefinitionParser:
         if 'tests' not in unit_data and 'unit' not in unit_data:
             # It is not a valid unit file
             return None
+        if 'skip_on' in unit_data and APP_NAME in unit_data['skip_on']:
+            LOG.warning(f"[PARSE] Skipping unit: {unit_file}")
+            return None
         LOG.debug(f"Found unit: {unit_file}")
         return self.parse_unit_definition(unit_data, unit_file.stem, suite=suite)
 
     def parse_suite_definition(self, df: Dict[str, Any], master_name: str = None) -> 'SuiteDef':
-        metadata = self._parse_general_metadata(df, 'master', master_name)
+        metadata = self._parse_metadata(df, 'master', master_name)
         suite_def = SuiteDef(metadata)
         suite_def.settings = df.get('settings', {})
         suite_def.overrides = df.get('overrides', [])
@@ -179,41 +195,36 @@ class DefinitionParser:
 
     def parse_unit_definition(self, df: Dict[str, Any], unit_name: str = None,
                               suite: 'SuiteDef' = None) -> UnitDef:
-        metadata = self._parse_general_metadata(df, 'unit', unit_name)
+        metadata = self._parse_metadata(df, 'unit', unit_name)
         unit_definition = UnitDef(metadata)
         unit_definition.suite = suite
         unit_definition.settings = df.get('settings', {})
 
-        for test_df in df['tests']:
-            parsed = self.parse_test_def(unit_definition, test_df)
+        for idx, test_df in enumerate(df['tests']):
+            parsed = self.parse_test_def(unit_definition, test_df, idx=idx)
             unit_definition.tests.extend(parsed)
 
         return unit_definition
 
-    def parse_test_def(self, unit_definition: 'UnitDef', df: Dict[str, Any]) -> List['TestDef']:
+    def parse_test_def(self, unit_definition: 'UnitDef',
+                       df: Dict[str, Any], idx: int = 0) -> List['TestDef']:
         # general params
-        name = df['name']
-        desc = df.get('desc', name)
-        pts = df.get('pts', 0.0)
-        metadata = {
-            'name': name,
-            'desc': desc,
-            'pts': pts,
-        }
+        metadata = self._parse_metadata(df, metadata_name=None, default_name=f'test-{idx}')
 
         if 'template' in df:
-            return self.parse_test_template(unit_definition, df, name, desc)
+            return self.parse_test_template(unit_definition, df, metadata)
 
         stdin = df.get('in', df.get('stdin'))
         args = df.get('args', [])
         # Ability to explicitly set to None - null, if null, do not check
         exit_code = df['exit'] if 'exit' in df else 0
         test_df = TestDef(metadata, stdin, exit_code, args, checks=[], unit=unit_definition)
-        test_df.checks = self.parse_checks(df, test_df)
+        test_df.checks = self._parse_checks(df, test_df)
+        test_df.pre_tasks = self._parse_pre_tasks(df, test_df)
         return [test_df]
 
     def parse_test_template(self, unit_definition: 'UnitDef', df: Dict[str, Any],
-                            test_name: str, test_desc: str):
+                            test_metadata: DefinitionMetadata):
         template = df['template']
         tests = []
         for (idx, case) in enumerate(df['cases']):
@@ -223,53 +234,59 @@ class DefinitionParser:
             case_df = {**expanded, **cc}
             case_name = case_df.get('name', idx)
             case_desc = case_df.get('desc', idx)
-            case_df['name'] = f"{test_name}@{case_name}"
-            case_df['desc'] = f"{test_desc} @ {case_desc}"
+            case_df['name'] = f"{test_metadata.name}@{case_name}"
+            case_df['desc'] = f"{test_metadata.desc} @ {case_desc}"
             tests.extend(self.parse_test_def(unit_definition, case_df))
         return tests
 
-    def parse_checks(self, df: Dict[str, Any], test_df: 'TestDef') -> List['CheckDef']:
+    def _parse_checks(self, df: Dict[str, Any], test_df: 'TestDef') -> List['TaskDef']:
         checks = []
         stdout = df.get('out', df.get('stdout'))
         if not _should_ignore(stdout):
-            checks.append(self._file_assertion("@stdout", stdout, test_df))
+            checks.append(self._file_check("@stdout", stdout, test_df))
 
         stderr = df.get('err', df.get('stderr'))
         if not _should_ignore(stderr):
-            checks.append(self._file_assertion("@stderr", stderr, test_df))
+            checks.append(self._file_check("@stderr", stderr, test_df))
 
         exit_code = df.get('exit', df.get('exit_code', 0))
         if not _should_ignore(exit_code):
-            assertion = Assertion(ExitCodeAssertionRunner.NAME, dict(expected=exit_code))
-            check = CheckDef("exit_check",
-                             "Check the command exit code (main return value)",
-                             assertion, test=test_df)
+            check = TaskDef(ExitCodeCheckTask.NAME,
+                            desc="Check the command exit code (main return value)",
+                            params=dict(expected=exit_code), test=test_df)
             checks.append(check)
 
         files = df.get('files')
         if files is not None and isinstance(files, dict):
             for prov, exp in files.items():
-                check = self._file_assertion(prov, exp, test_df)
+                check = self._file_check(prov, exp, test_df)
                 checks.append(check)
 
         return checks
 
-    def _parse_general_metadata(self, df: Dict[str, Any], metadata_name: str, default_name: str):
-        general_df = df.get(metadata_name)
-        if not general_df:
-            general_df = {'name': default_name, 'desc': default_name, 'pts': None}
+    def _parse_pre_tasks(self, df: Dict[str, Any], test_df: 'TestDef'):
+        tasks = []
+        data = df.get('data')
+        if data:
+            tasks.append(
+                TaskDef(CopyFilesTask.NAME, kind=CopyFilesTask.NAME, params={'files': data})
+            )
+        return tasks
+
+    def _parse_metadata(self, df: Dict[str, Any], metadata_name: Optional[str],
+                        default_name: str) -> DefinitionMetadata:
+        general_df = df.get(metadata_name) if metadata_name else df
+        if not general_df and metadata_name:
+            general_df = {'name': default_name, 'desc': default_name, 'pts': 0.0}
         if 'name' not in general_df:
             general_df['name'] = default_name
-        return general_df
+        return DefinitionMetadata.from_dict(general_df)
 
-    def _file_assertion(self, selector: str, value, test_df: 'TestDef'):
-        assertion = Assertion(
-            FileAssertionRunner.NAME,
-            dict(selector=selector, expected=value)
-        )
-        check = CheckDef("file_check", f"Check the file content [{selector}]",
-                         assertion, test=test_df)
-        return check
+    def _file_check(self, selector: str, value, test_df: 'TestDef'):
+        return TaskDef(FileCheckTask.NAME,
+                       desc=f"Check the file content [{selector}]",
+                       params=dict(selector=selector, expected=value),
+                       test=test_df)
 
     def _find_units(self, suite: 'SuiteDef', name: str = '*') -> List['UnitDef']:
         units = []
@@ -319,6 +336,10 @@ class GeneralResult(AsDict):
     @classmethod
     def mk_fail(cls, df: 'GeneralDefType', message: str) -> 'GeneralResultType':
         return cls(df, kind=ResultKind.FAIL, message=message)
+
+    @classmethod
+    def mk_pass(cls, df: 'GeneralDefType') -> 'GeneralResultType':
+        return cls(df, kind=ResultKind.PASS, message="Passed!")
 
     def __init__(self, df: 'GeneralDefType', kind: ResultKind = ResultKind.PASS,
                  message: str = None):
@@ -370,7 +391,7 @@ class TestRunResult(GeneralResult):
 
 
 class CheckResult(GeneralResult):
-    def __init__(self, df: 'CheckDef', kind: ResultKind, message: str = "",
+    def __init__(self, df: 'TaskDef', kind: ResultKind, message: str = "",
                  expected=None, provided=None, detail=None, diff=None):
         super().__init__(df, kind=kind, message=message)
         self.expected = expected
@@ -413,7 +434,7 @@ def _merge_settings(unit_df: 'UnitDef') -> Dict[str, Any]:
 class DefinitionRunner:
     def __init__(self, paths: 'AppConfig'):
         self.paths = paths
-        self.assertion_runners = AssertionRunners.instance()
+        self.task_runners = TaskRunners.instance()
 
     def run_suite(self, suite_df: 'SuiteDef') -> 'SuiteRunResult':
         LOG.info(f"[RUN] Running the suite: {suite_df.name}")
@@ -429,6 +450,15 @@ class DefinitionRunner:
         unit_ws = self.paths.unit_workspace(unit_df.suite.name, unit_df.name)
         settings = _merge_settings(unit_df)
         LOG.debug(f"[RUN] Creating unit workspace: {unit_ws}")
+
+        for task_df in unit_df.pre_tasks:
+            task_result = self.run_task(task_df, unit_ws, settings=settings)
+            LOG.debug(f"[RUN] Task [{task_df.kind}] result: {task_result.kind}")
+            unit_result.add_subresult(task_result)
+            if task_result.is_fail():
+                LOG.warning("[RUN] Unit execution ended since one of the pre-tasks has failed")
+                return unit_result
+
         for test_df in unit_df.tests:
             test_result = self.run_test(test_df, unit_ws, settings=settings)
             LOG.debug(f"[RUN] Test [{test_df.name}] result: {test_result.kind}")
@@ -440,34 +470,36 @@ class DefinitionRunner:
                  settings: Dict[str, Any] = None) -> 'TestRunResult':
         LOG.info(f"[RUN] Running the test{test_df.name} from {test_df.unit.name}")
         test_result = TestRunResult(test_df)
-        cmd, args = self._get_command(test_df, unit_ws, settings)
-        timeout = settings.get('timeout', GLOBAL_TIMEOUT)
-        data_dir = Path(settings.get('data', self.paths.data_dir))
-        stdin = _resolve_file(test_df.stdin, root=data_dir)
+        ctx = TestCtx(self.paths, test_df, settings)
+
         try:
-            cmd_res = execute_cmd(cmd,
-                                  args=args,
-                                  stdin=stdin,
-                                  nm=test_df.name,
-                                  env=test_df.env,
-                                  timeout=timeout,
-                                  ws=unit_ws)
-            test_result.cmd_result = cmd_res
-            ctx = TestCtx(self.paths, test_df, cmd_res, settings)
-            # if settings.get('valgrind', False):
-            #     test_df.checks.append(CheckDef("valgrind", "Check the execution using valgrind",
-            #                                    Assertion("")))
-            for check_df in test_df.checks:
-                check_result = self.run_check(ctx, check_df)
-                LOG.debug(f"[RUN] Check {check_df.name} for"
-                          f" test [{test_df.name}] result: {check_result.kind}")
-                test_result.add_subresult(check_result)
-            return test_result
+            ctx.cmd_res = self._execute_tested_command(ctx)
         except Exception as e:
             LOG.error("Execution failed: ", e)
             test_result.kind = ResultKind.FAIL
             test_result.message = f"Execution failed: {e}"
             return test_result
+
+        for check_df in test_df.checks:
+            check_result = self.run_check(ctx, check_df)
+            LOG.debug(f"[RUN] Check {check_df.name} for"
+                      f" test [{test_df.name}] result: {check_result.kind}")
+            test_result.add_subresult(check_result)
+        return test_result
+
+    def _execute_tested_command(self, ctx: 'TestCtx') -> 'CommandResult':
+        cmd, args = self._get_command(ctx.test_df, ctx.ws, ctx.settings)
+        timeout = ctx.settings.get('timeout', GLOBAL_TIMEOUT)
+        data_dir = Path(ctx.settings.get('data', self.paths.data_dir))
+        stdin = _resolve_file(ctx.test_df.stdin, root=data_dir)
+
+        return execute_cmd(cmd,
+                           args=args,
+                           stdin=stdin,
+                           nm=ctx.test_df.name,
+                           env=ctx.test_df.env,
+                           timeout=timeout,
+                           ws=ctx.ws)
 
     def _get_command(self, test_df: 'TestDef', unit_ws: Path, settings):
         cmd = settings.get('command', self.paths.command)
@@ -484,24 +516,27 @@ class DefinitionRunner:
         cmd_args = test_df.args
         return vg_cmd, [*vg_args, '--', cmd, *cmd_args]
 
-    def run_check(self, ctx: 'TestCtx', check_df: 'CheckDef'):
-        LOG.info(f"[RUN] Running Check: {check_df.name} for {ctx.test_df.name}")
+    def run_check(self, ctx: 'TestCtx', task_df: 'TaskDef'):
+        LOG.info(f"[RUN] Running Check: {task_df.name} for {ctx.test_df.name}")
 
-        kind = check_df.assertion.kind
-        assertion_runner = self.assertion_runners.get(kind)
-        if assertion_runner is None:
-            return CheckResult.mk_fail(check_df, f"Unable find assertion runner: {kind}")
-        instance = assertion_runner(ctx, check_df)
+        kind = task_df.kind
+        task_runner = self.task_runners.get(kind)
+        if task_runner is None:
+            return CheckResult.mk_fail(task_df, f"Unable find config runner: {kind}")
+        instance = task_runner(ctx, task_df)
         return instance.evaluate()
+
+    def run_task(self, task_df, unit_ws, settings) -> 'CheckResult':
+        return None
 
 
 class TestCtx:
     def __init__(self, paths: 'AppConfig', test_df: 'TestDef',
-                 cmd_res: 'CommandResult', settings: Dict[str, Any]):
+                 settings: Dict[str, Any], cmd_res: 'CommandResult' = None):
         self.paths = paths
         self.test_df = test_df
-        self.cmd_res = cmd_res
         self.settings = settings
+        self.cmd_res = cmd_res
 
     @property
     def ws(self) -> Path:
@@ -511,27 +546,35 @@ class TestCtx:
     def data_dir(self) -> Path:
         return Path(self.settings.get('data', self.paths.data_dir))
 
+    def resolve_dir(self, file_type: str) -> Path:
+        mapping = {
+            'data': self.data_dir,
+            'tests': self.paths.tests_dir,
+            'artifacts': self.ws,
+        }
+        return mapping.get(file_type.lower(), self.ws) if file_type else self.ws
 
-class AssertionRunner:
+
+class TaskRunner:
     NAME = None
 
-    def __init__(self, ctx: 'TestCtx', check_df: 'CheckDef'):
+    def __init__(self, ctx: 'TestCtx', check_df: 'TaskDef'):
         self.ctx: 'TestCtx' = ctx
-        self.check_df: CheckDef = check_df
+        self.check_df: TaskDef = check_df
 
     @property
-    def assertion(self) -> 'Assertion':
-        return self.check_df.assertion
+    def task_df(self) -> 'TaskDef':
+        return self.check_df
 
     @property
     def params(self) -> Dict['str', Any]:
-        return self.assertion.params
+        return self.task_df.params
 
     def evaluate(self) -> 'CheckResult':
         return CheckResult.mk_fail(self.check_df, "Unimplemented check")
 
 
-class FileAssertionRunner(AssertionRunner):
+class FileCheckTask(TaskRunner):
     NAME = "file_cmp"
 
     def evaluate(self) -> 'CheckResult':
@@ -573,7 +616,41 @@ class FileAssertionRunner(AssertionRunner):
         )
 
 
-class ExitCodeAssertionRunner(AssertionRunner):
+class ExistFilesTasks(TaskRunner):
+    NAME = "exist_file"
+
+    def evaluate(self) -> 'CheckResult':
+        files = self.params['files']
+        for fdf in files:
+            file = fdf['file']
+            fdir: Path = self.ctx.resolve_dir(fdf.get('type', 'artifacts'))
+            pth = fdir / file
+            if not pth.exists():
+                return CheckResult(
+                    self.check_df, ResultKind.FAIL,
+                    message="Required file does not exists",
+                    provided=pth,
+                    expected="exists",
+                    diff=f"File does not exists: {pth}"
+                )
+        return CheckResult.mk_pass(self.check_df)
+
+
+class CopyFilesTask(TaskRunner):
+    NAME = "copy_files"
+
+    def evaluate(self) -> 'CheckResult':
+        files = self.params['files']
+        for fpattern in files:
+            for fp in self.ctx.data_dir.glob(fpattern):
+                dest = self.ctx.ws / fp.name
+                LOG.debug(f"[COPY] Copying file: {fp} to {dest}")
+                shutil.copy2(fp, dest)
+
+        return CheckResult.mk_pass(self.check_df)
+
+
+class ExitCodeCheckTask(TaskRunner):
     NAME = "exit_code"
 
     def evaluate(self) -> 'CheckResult':
@@ -589,7 +666,7 @@ class ExitCodeAssertionRunner(AssertionRunner):
         )
 
 
-class ValgrindAssertionRunner(AssertionRunner):
+class ValgrindTask(TaskRunner):
     NAME = "valgrind"
 
     def evaluate(self) -> 'CheckResult':
@@ -614,29 +691,29 @@ class ValgrindAssertionRunner(AssertionRunner):
         return 0
 
 
-class AssertionRunners:
+class TaskRunners:
     INSTANCE = None
 
     @classmethod
-    def instance(cls) -> 'AssertionRunners':
+    def instance(cls) -> 'TaskRunners':
         if cls.INSTANCE is None:
             cls.INSTANCE = cls.make()
         return cls.INSTANCE
 
     @classmethod
-    def make(cls) -> 'AssertionRunners':
-        instance = AssertionRunners()
-        instance.add(FileAssertionRunner.NAME, FileAssertionRunner)
-        instance.add(ExitCodeAssertionRunner.NAME, ExitCodeAssertionRunner)
+    def make(cls) -> 'TaskRunners':
+        instance = TaskRunners()
+        instance.add(FileCheckTask.NAME, FileCheckTask)
+        instance.add(ExitCodeCheckTask.NAME, ExitCodeCheckTask)
         return instance
 
     def __init__(self):
-        self.register: Dict[str, Type[AssertionRunner]] = {}
+        self.register: Dict[str, Type[TaskRunner]] = {}
 
-    def add(self, kind: str, runner: Type[AssertionRunner]):
+    def add(self, kind: str, runner: Type[TaskRunner]):
         self.register[kind] = runner
 
-    def get(self, kind: 'str') -> Optional[Type[AssertionRunner]]:
+    def get(self, kind: 'str') -> Optional[Type[TaskRunner]]:
         return self.register.get(kind)
 
 
@@ -680,13 +757,19 @@ def deep_template_expand(template: Any, variables: Dict[str, Any]):
 
 def execute_cmd(cmd: str, args: List[str], ws: Path, stdin: Optional[Path] = None,
                 stdout: Path = None, stderr: Path = None, nm: str = None,
-                log: logging.Logger = None, **kwargs) -> 'CommandResult':
+                log: logging.Logger = None, timeout: int = GLOBAL_TIMEOUT,
+                env: Dict[str, Any] = None, cwd: Union[str, Path] = None,
+                **kwargs) -> 'CommandResult':
     log = log or LOG
     log.info(f"[CMD]: {cmd} with args {args}")
     log.debug(f"[CMD]: {cmd} with stdin {stdin}")
+    log.debug(f"[CMD]: {cmd} with timeout {timeout}, cwd: {cwd}")
     nm = nm or cmd
     stdout = stdout or ws / f'{nm}.stdout'
     stderr = stderr or ws / f'{nm}.stderr'
+
+    full_env = {**os.environ, **(env or {})}
+
     with stdout.open('w') as fd_out, stderr.open('w') as fd_err:
         fd_in = Path(stdin).open('r') if stdin else None
         start_time = time.perf_counter_ns()
@@ -695,6 +778,9 @@ def execute_cmd(cmd: str, args: List[str], ws: Path, stdin: Optional[Path] = Non
             stdout=fd_out,
             stderr=fd_err,
             stdin=fd_in,
+            timeout=timeout,
+            env=full_env,
+            cwd=str(cwd) if cwd else None,
             **kwargs
         )
         if fd_in:
@@ -829,7 +915,7 @@ def print_suite_df(sdf: 'SuiteDef', colors: bool = True):
             for check in test.checks:
                 print(
                     f"\t\t * Check: [{tc.wrap(tc.MAGENTA, check.name)}] :: {check.desc} "
-                    f"[kind={check.assertion.kind}]"
+                    f"[kind={check.kind}]"
                 )
         print()
 
@@ -922,7 +1008,7 @@ def _resolve_def_file(name: str, root: Path, prefix=None) -> Optional['Path']:
     return None
 
 
-## App config
+## App params
 
 class AppConfig(AsDict):
     def __init__(self, command: str, tests_dir: Path, data_dir: Path = None,
